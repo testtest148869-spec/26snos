@@ -9,9 +9,17 @@ import time
 import os
 import json
 import hashlib
+import socks
 from datetime import datetime, timedelta
 from telethon import TelegramClient
-from telethon.errors import SessionPasswordNeededError, FloodWaitError, PhoneCodeInvalidError
+from telethon.errors import (
+    SessionPasswordNeededError,
+    FloodWaitError,
+    PhoneCodeInvalidError,
+    PhoneNumberInvalidError,
+    AuthKeyUnregisteredError,
+    RPCError
+)
 from telethon.tl.functions.messages import ReportRequest, ReportSpamRequest
 from telethon.tl.types import (
     InputReportReasonSpam,
@@ -24,11 +32,11 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 
 # ========== КОНФИГ ==========
-BOT_TOKEN = "8893474413:AAFHwmwA4nYivzTo29MYD-okhCT4LtynEbU"  # ← ЗАМЕНИТЬ
-ADMIN_IDS = [8402303508]  # ← ЗАМЕНИТЬ
+BOT_TOKEN = "8893474413:AAFHwmwA4nYivzTo29MYD-okhCT4LtynEbU"
+ADMIN_IDS = [8402303508]
 DB_NAME = "snoser.db"
-API_ID = 2040
-API_HASH = "b18441a1ff607e10a989891a5462e627"
+API_ID = 35186026
+API_HASH = "976381c9c033978b507a891290c15536"
 
 # ========== БД ==========
 def init_db():
@@ -62,6 +70,9 @@ def init_db():
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     c.execute("INSERT OR IGNORE INTO stats (id, total_reports, successful_reports) VALUES (1, 0, 0)")
+    # Добавляем админов из ADMIN_IDS
+    for admin_id in ADMIN_IDS:
+        c.execute("INSERT OR IGNORE INTO users (user_id, is_admin) VALUES (?, 1)", (admin_id,))
     conn.commit()
     conn.close()
 
@@ -80,21 +91,6 @@ def has_subscription(user_id: int) -> bool:
         except:
             return False
     return False
-
-def get_subscription_days(user_id: int) -> int:
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("SELECT sub_until FROM users WHERE user_id=?", (user_id,))
-    row = c.fetchone()
-    conn.close()
-    if row and row[0]:
-        try:
-            until = datetime.fromisoformat(row[0])
-            diff = until - datetime.now()
-            return diff.days
-        except:
-            return 0
-    return 0
 
 def give_subscription(user_id: int, days: int):
     until = (datetime.now() + timedelta(days=days)).isoformat()
@@ -126,13 +122,6 @@ def add_session(session_string, phone):
     c = conn.cursor()
     c.execute("INSERT INTO sessions (session_string, phone, added_at) VALUES (?, ?, ?)",
               (session_string, phone, datetime.now().isoformat()))
-    conn.commit()
-    conn.close()
-
-def update_session_status(session_id, status):
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("UPDATE sessions SET is_active=? WHERE id=?", (status, session_id))
     conn.commit()
     conn.close()
 
@@ -174,11 +163,11 @@ async def add_session_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Нет прав")
         return
     
-    # ШАГ 1: Просим номер
     await update.message.reply_text(
         "📱 *Добавление сессии (шаг 1/3)*\n\n"
         "Введи номер телефона в международном формате:\n"
-        "Пример: `+79991234567`",
+        "Пример: `+79991234567`\n\n"
+        "Или отправь файл `.session`",
         parse_mode="Markdown"
     )
     context.user_data['add_session_step'] = 'phone'
@@ -191,6 +180,9 @@ async def handle_add_session_message(update: Update, context: ContextTypes.DEFAU
     step = context.user_data.get('add_session_step')
     text = update.message.text.strip()
     
+    if not step:
+        return
+    
     if step == 'phone':
         if not text.startswith('+') or not text[1:].isdigit():
             await update.message.reply_text("❌ Неверный формат. Пример: `+79991234567`", parse_mode="Markdown")
@@ -199,35 +191,54 @@ async def handle_add_session_message(update: Update, context: ContextTypes.DEFAU
         context.user_data['add_session_phone'] = text
         context.user_data['add_session_step'] = 'code'
         
-        # Создаём клиента для отправки кода
-        client = TelegramClient("temp_session", API_ID, API_HASH)
-        await client.connect()
         try:
-            await client.send_code_request(text)
-            context.user_data['add_session_client'] = client
-            await update.message.reply_text(
-                "📱 *Добавление сессии (шаг 2/3)*\n\n"
-                "Код отправлен на номер.\n"
-                "Введи код из Telegram:",
-                parse_mode="Markdown"
-            )
+            client = TelegramClient("temp_session", API_ID, API_HASH)
+            await client.connect()
+            
+            try:
+                await client.send_code_request(text)
+                context.user_data['add_session_client'] = client
+                await update.message.reply_text(
+                    "📱 *Добавление сессии (шаг 2/3)*\n\n"
+                    "Код отправлен на номер.\n"
+                    "Введи код из Telegram (только цифры):",
+                    parse_mode="Markdown"
+                )
+            except PhoneNumberInvalidError:
+                await update.message.reply_text("❌ Неверный номер телефона. Проверь формат.")
+                context.user_data['add_session_step'] = None
+                try:
+                    await client.disconnect()
+                except:
+                    pass
+            except Exception as e:
+                await update.message.reply_text(f"❌ Ошибка при отправке кода: {str(e)}")
+                context.user_data['add_session_step'] = None
+                try:
+                    await client.disconnect()
+                except:
+                    pass
+                
         except Exception as e:
-            await update.message.reply_text(f"❌ Ошибка: {str(e)}")
+            await update.message.reply_text(f"❌ Ошибка подключения: {str(e)}")
             context.user_data['add_session_step'] = None
     
     elif step == 'code':
-        code = text
+        code = text.strip()
+        if not code.isdigit():
+            await update.message.reply_text("❌ Код должен состоять только из цифр")
+            return
+        
         phone = context.user_data.get('add_session_phone')
         client = context.user_data.get('add_session_client')
         
         if not client:
-            await update.message.reply_text("❌ Ошибка: сессия не найдена. Начни заново.")
+            await update.message.reply_text("❌ Ошибка: сессия не найдена. Начни заново через /start")
             context.user_data['add_session_step'] = None
             return
         
         try:
             await client.sign_in(phone, code)
-            # Успешный вход
             session_string = client.session.save()
             add_session(session_string, phone)
             await client.disconnect()
@@ -248,7 +259,6 @@ async def handle_add_session_message(update: Update, context: ContextTypes.DEFAU
             )
             
         except SessionPasswordNeededError:
-            # ШАГ 3: Требуется 2FA
             context.user_data['add_session_step'] = '2fa'
             await update.message.reply_text(
                 "🔐 *Добавление сессии (шаг 3/3)*\n\n"
@@ -260,9 +270,16 @@ async def handle_add_session_message(update: Update, context: ContextTypes.DEFAU
         except PhoneCodeInvalidError:
             await update.message.reply_text("❌ Неверный код. Попробуй ещё раз:")
             
+        except FloodWaitError as e:
+            await update.message.reply_text(f"⏳ Слишком много попыток. Подожди {e.seconds} секунд.")
+            
         except Exception as e:
             await update.message.reply_text(f"❌ Ошибка: {str(e)}")
             context.user_data['add_session_step'] = None
+            try:
+                await client.disconnect()
+            except:
+                pass
     
     elif step == '2fa':
         password = text
@@ -270,7 +287,7 @@ async def handle_add_session_message(update: Update, context: ContextTypes.DEFAU
         phone = context.user_data.get('add_session_phone')
         
         if not client:
-            await update.message.reply_text("❌ Ошибка. Начни заново.")
+            await update.message.reply_text("❌ Ошибка. Начни заново через /start")
             context.user_data['add_session_step'] = None
             return
         
@@ -297,8 +314,58 @@ async def handle_add_session_message(update: Update, context: ContextTypes.DEFAU
             
         except Exception as e:
             await update.message.reply_text(f"❌ Ошибка: {str(e)}")
+            context.user_data['add_session_step'] = None
 
-# ========== ОБРАБОТЧИКИ КОМАНД ==========
+# ========== ЗАГРУЗКА ФАЙЛА СЕССИИ ==========
+async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_IDS:
+        return
+    
+    if not update.message.document:
+        return
+    
+    file = update.message.document
+    if not file.file_name.endswith('.session'):
+        await update.message.reply_text("❌ Файл должен иметь расширение `.session`")
+        return
+    
+    try:
+        file_path = f"temp_{file.file_id}.session"
+        await file.download_to_drive(file_path)
+        
+        if os.path.getsize(file_path) == 0:
+            await update.message.reply_text("❌ Файл пустой")
+            os.remove(file_path)
+            return
+        
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            session_string = f.read()
+        
+        if not session_string or len(session_string) < 10:
+            await update.message.reply_text("❌ Невалидный файл сессии")
+            os.remove(file_path)
+            return
+        
+        add_session(session_string, f"File_{file.file_id[:8]}")
+        os.remove(file_path)
+        
+        sessions = get_sessions()
+        active = get_active_sessions()
+        
+        await update.message.reply_text(
+            f"✅ *Сессия добавлена из файла!*\n\n"
+            f"📊 Всего сессий: {len(sessions)}\n"
+            f"✅ Активных: {len(active)}",
+            parse_mode="Markdown"
+        )
+        
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {str(e)}")
+        if os.path.exists(file_path):
+            os.remove(file_path)
+
+# ========== АДМИН-ПАНЕЛЬ ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in ADMIN_IDS:
@@ -382,6 +449,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
         context.user_data['add_session_step'] = 'phone'
+        await query.message.delete()
     
     elif data == "add_session_file":
         await query.edit_message_text(
@@ -395,15 +463,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "report":
         await query.edit_message_text(
             "🎯 *Снос цели*\n\n"
-            "Выбери причину репорта:\n"
-            "1️⃣ Спам\n"
-            "2️⃣ Насилие\n"
-            "3️⃣ Порнография\n"
-            "4️⃣ Личные данные\n"
-            "5️⃣ Другое\n\n"
             "Используй команду:\n"
             "`/report <ссылка> <причина>`\n\n"
-            "Пример: `/report https://t.me/username/123 1`",
+            "Пример: `/report https://t.me/username/123 1`\n\n"
+            "Причины:\n"
+            "1 - Спам\n"
+            "2 - Насилие\n"
+            "3 - Порнография\n"
+            "4 - Личные данные\n"
+            "5 - Другое",
             parse_mode="Markdown"
         )
     
@@ -437,11 +505,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "ℹ️ *Помощь*\n\n"
             "📌 Команды:\n"
             "/start - Открыть меню\n"
-            "/addsession <номер> <код> [2fa] - Добавить сессию\n"
-            "/report <ссылка> <причина> - Отправить репорт\n"
-            "/sessions - Список сессий\n"
-            "/stats - Статистика\n"
             "/givesub <id> <дни> - Выдать подписку\n"
+            "/report <ссылка> <причина> - Снос цели\n"
             "/delete <id> - Удалить сессию\n\n"
             "📌 Причины:\n"
             "1 - Спам\n"
@@ -553,7 +618,6 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Неверная причина. Используй 1-5")
         return
     
-    # Разбираем ссылку
     parts = target.split("/")
     try:
         entity = parts[-2]
@@ -575,23 +639,20 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for s in sessions:
         try:
             client = TelegramClient("report_session", API_ID, API_HASH)
-            client.session.save()
             await client.connect()
             
-            # Пытаемся загрузить сессию
             try:
-                client.session.set_dc(2, '149.154.167.40', 443)
                 await client.get_me()
-            except:
+            except AuthKeyUnregisteredError:
+                continue
+            except Exception:
                 continue
             
-            # Получаем сущность
             try:
                 entity_obj = await client.get_entity(entity)
-            except:
+            except Exception:
                 continue
             
-            # Отправляем репорт
             if reason_id == 1:
                 await client(ReportSpamRequest(peer=entity_obj))
             else:
@@ -606,8 +667,10 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             update_stats(successful=1, total=1)
             add_report_log(target, str(reason_id), 1)
             
+            await asyncio.sleep(0.5)
+            
         except FloodWaitError as e:
-            await asyncio.sleep(e.seconds)
+            await asyncio.sleep(min(e.seconds, 10))
             failed += 1
         except Exception:
             failed += 1
@@ -625,50 +688,6 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-# ========== ЗАГРУЗКА ФАЙЛА СЕССИИ ==========
-async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in ADMIN_IDS:
-        return
-    
-    if not context.user_data.get('adding_session'):
-        return
-    
-    if not update.message.document:
-        await update.message.reply_text("❌ Отправь файл .session")
-        return
-    
-    file = update.message.document
-    if not file.file_name.endswith('.session'):
-        await update.message.reply_text("❌ Файл должен иметь расширение .session")
-        return
-    
-    file_path = f"temp_{file.file_id}.session"
-    await file.download_to_drive(file_path)
-    
-    try:
-        with open(file_path, 'r') as f:
-            session_string = f.read()
-        
-        add_session(session_string, f"File_{file.file_id[:8]}")
-        context.user_data['adding_session'] = False
-        
-        sessions = get_sessions()
-        active = get_active_sessions()
-        
-        await update.message.reply_text(
-            f"✅ *Сессия добавлена из файла!*\n\n"
-            f"📊 Всего сессий: {len(sessions)}\n"
-            f"✅ Активных: {len(active)}",
-            parse_mode="Markdown"
-        )
-        
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка: {str(e)}")
-    finally:
-        if os.path.exists(file_path):
-            os.remove(file_path)
-
 # ========== ЗАПУСК ==========
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
@@ -678,7 +697,6 @@ def main():
     app.add_handler(CommandHandler("givesub", give_sub))
     app.add_handler(CommandHandler("report", report_command))
     app.add_handler(CommandHandler("delete", delete_session_command))
-    app.add_handler(CommandHandler("stats", lambda u,c: button_handler(u,c) if u.message else None))
     
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_add_session_message))
