@@ -24,8 +24,8 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 
 # ========== КОНФИГ ==========
-BOT_TOKEN = "ТВОЙ_ТОКЕН_БОТА"  # ← ЗАМЕНИТЬ
-ADMIN_IDS = [123456789]  # ← ЗАМЕНИТЬ
+BOT_TOKEN = "8893474413:AAFHwmwA4nYivzTo29MYD-okhCT4LtynEbU"  # ← ЗАМЕНИТЬ
+ADMIN_IDS = [8402303508]  # ← ЗАМЕНИТЬ
 DB_NAME = "snoser.db"
 API_ID = 2040
 API_HASH = "b18441a1ff607e10a989891a5462e627"
